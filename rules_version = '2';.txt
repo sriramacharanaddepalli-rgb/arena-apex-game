@@ -1,0 +1,17 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. RULE FOR THE PUBLIC GAME LEADERBOARD
+    // This allows any authenticated user (including the anonymous user signed in 
+    // by the game) to read and write scores to the public collection.
+    match /artifacts/{appId}/public/data/game_scores/{documentId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // 2. DEFAULT PRIVATE DATA RULE (Keep this for safety)
+    match /artifacts/{appId}/users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}
