@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arena Apex - Top-Down Shooter</title>
+    <!-- Load Tailwind CSS for modern UI styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Imports for Persistent High Scores ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, onSnapshot, collection, query, limit, orderBy, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Use Debug logging to see detailed logs in console
+        setLogLevel('Debug');
+
+        let db;
+        let auth;
+        let userId = 'anonymous'; // Default ID, will be overwritten after auth
+        let appId;
+        let isAuthReady = false;
+
+        // Global variables provided by the environment (MANDATORY USE)
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        appId = typeof __app_id !== 'undefined' ? __app_id : 'default-arena-app';
+
+        if (firebaseConfig) {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // Auth Listener and Sign In
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-id').textContent = userId;
+                    isAuthReady = true;
+                } else {
+                    // Sign in with custom token or anonymously
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase Auth Error:", error);
+                    }
+                }
+            });
+        } else {
+            console.warn("Firebase config not found. High scores will not be saved.");
+            isAuthReady = true; // Still allow the game to start
+        }
+
+        // Helper function for Firestore paths
+        const getPublicScoresCollection = () => {
+            if (!db) return null;
+            return collection(db, `artifacts/${appId}/public/data/arenaGameScores`);
+        };
+
+        // --- Game Setup and Classes ---
+
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const gameContainer = document.getElementById('game-container');
+
+        // Set initial canvas dimensions based on container
+        let W, H;
+        function resizeCanvas() {
+            W = gameContainer.clientWidth;
+            H = gameContainer.clientHeight;
+            canvas.width = W;
+            canvas.height = H;
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        const KEYS = {};
+        const mouse = { x: 0, y: 0 };
+        let gameLoopId;
+        let player, enemies = [], projectiles = [], enemyProjectiles = [];
+        let score = 0;
+        let isGameOver = false;
+        let spawnTimer = 0;
+        let difficultyMultiplier = 1;
+        
+        const MAX_ENEMIES = 15;
+
+        // Player Class
+        class Player {
+            constructor() {
+                this.x = W / 2;
+                this.y = H / 2;
+                this.radius = 15;
+                this.color = 'lime';
+                this.speed = 5;
+                this.hp = 100;
+                this.maxHp = 100;
+                this.fireRate = 15; // Frames between shots
+                this.fireCooldown = 0;
+                this.lastMoveTime = Date.now();
+            }
+
+            draw() {
+                // Body
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Direction line (aim)
+                const angle = Math.atan2(mouse.y - this.y, mouse.x - this.x);
+                ctx.strokeStyle = '#000000';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(this.x, this.y);
+                ctx.lineTo(this.x + Math.cos(angle) * this.radius, this.y + Math.sin(angle) * this.radius);
+                ctx.stroke();
+
+                // HP Bar
+                ctx.fillStyle = 'red';
+                ctx.fillRect(this.x - this.radius, this.y - this.radius - 10, this.radius * 2, 5);
+                ctx.fillStyle = 'green';
+                const healthWidth = (this.hp / this.maxHp) * this.radius * 2;
+                ctx.fillRect(this.x - this.radius, this.y - this.radius - 10, healthWidth, 5);
+            }
+
+            update() {
+                let dx = 0;
+                let dy = 0;
+
+                if (KEYS['w'] || KEYS['W'] || KEYS['ArrowUp']) dy -= 1;
+                if (KEYS['s'] || KEYS['S'] || KEYS['ArrowDown']) dy += 1;
+                if (KEYS['a'] || KEYS['A'] || KEYS['ArrowLeft']) dx -= 1;
+                if (KEYS['d'] || KEYS['D'] || KEYS['ArrowRight']) dx += 1;
+
+                if (dx !== 0 || dy !== 0) {
+                    this.lastMoveTime = Date.now();
+                    const magnitude = Math.sqrt(dx * dx + dy * dy);
+                    if (magnitude > 0) {
+                        dx /= magnitude;
+                        dy /= magnitude;
+                    }
+                    this.x += dx * this.speed;
+                    this.y += dy * this.speed;
+                }
+
+                // Keep player within bounds
+                this.x = Math.max(this.radius, Math.min(W - this.radius, this.x));
+                this.y = Math.max(this.radius, Math.min(H - this.radius, this.y));
+
+                if (this.fireCooldown > 0) {
+                    this.fireCooldown--;
+                }
+            }
+
+            shoot(targetX, targetY) {
+                if (this.fireCooldown <= 0) {
+                    const angle = Math.atan2(targetY - this.y, targetX - this.x);
+                    projectiles.push(new Projectile(this.x, this.y, angle, true));
+                    this.fireCooldown = this.fireRate;
+                }
+            }
+        }
+
+        // Enemy Class
+        class Enemy {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.radius = 12;
+                this.color = 'red';
+                this.speed = 2 * difficultyMultiplier;
+                this.hp = 10 * difficultyMultiplier;
+                this.maxHp = this.hp;
+                this.fireRate = 90 / difficultyMultiplier; // Slower fire rate
+                this.fireCooldown = Math.random() * this.fireRate;
+            }
+
+            draw() {
+                // Body
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+                
+                // Eyes/Face (simple dot for visibility)
+                ctx.fillStyle = 'white';
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, 3, 0, Math.PI * 2);
+                ctx.fill();
+
+                // HP Bar
+                ctx.fillStyle = 'red';
+                ctx.fillRect(this.x - this.radius, this.y - this.radius - 10, this.radius * 2, 5);
+                ctx.fillStyle = 'green';
+                const healthWidth = (this.hp / this.maxHp) * this.radius * 2;
+                ctx.fillRect(this.x - this.radius, this.y - this.radius - 10, healthWidth, 5);
+            }
+
+            update() {
+                // Simple AI: chase the player
+                const angle = Math.atan2(player.y - this.y, player.x - this.x);
+                this.x += Math.cos(angle) * this.speed;
+                this.y += Math.sin(angle) * this.speed;
+
+                // Fire at player
+                if (this.fireCooldown <= 0) {
+                    this.shoot(player.x, player.y);
+                    this.fireCooldown = this.fireRate + Math.random() * 30; // Randomize next shot
+                } else {
+                    this.fireCooldown--;
+                }
+            }
+
+            shoot(targetX, targetY) {
+                const angle = Math.atan2(targetY - this.y, targetX - this.x);
+                enemyProjectiles.push(new Projectile(this.x, this.y, angle, false));
+            }
+        }
+
+        // Projectile Class
+        class Projectile {
+            constructor(x, y, angle, isPlayer) {
+                this.x = x;
+                this.y = y;
+                this.radius = isPlayer ? 4 : 5;
+                this.color = isPlayer ? 'yellow' : 'cyan';
+                this.speed = isPlayer ? 15 : 8;
+                this.isPlayer = isPlayer;
+                this.dx = Math.cos(angle) * this.speed;
+                this.dy = Math.sin(angle) * this.speed;
+            }
+
+            draw() {
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            update() {
+                this.x += this.dx;
+                this.y += this.dy;
+            }
+
+            isOffScreen() {
+                return this.x < 0 || this.x > W || this.y < 0 || this.y > H;
+            }
+        }
+
+        // Utility function for distance
+        function dist(x1, y1, x2, y2) {
+            return Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+        }
+
+        // Spawn a new enemy at a random edge of the screen
+        function spawnEnemy() {
+            let x, y;
+            const edge = Math.floor(Math.random() * 4); // 0: Top, 1: Right, 2: Bottom, 3: Left
+            const padding = 50;
+
+            if (edge === 0) { // Top
+                x = Math.random() * W;
+                y = -padding;
+            } else if (edge === 1) { // Right
+                x = W + padding;
+                y = Math.random() * H;
+            } else if (edge === 2) { // Bottom
+                x = Math.random() * W;
+                y = H + padding;
+            } else { // Left
+                x = -padding;
+                y = Math.random() * H;
+            }
+
+            enemies.push(new Enemy(x, y));
+        }
+
+        // --- Game Loop and Logic ---
+
+        function updateGame() {
+            if (isGameOver) {
+                cancelAnimationFrame(gameLoopId);
+                return;
+            }
+
+            // 1. Update Player
+            player.update();
+
+            // 2. Spawn Enemies
+            spawnTimer++;
+            if (enemies.length < MAX_ENEMIES && (spawnTimer % (60 / difficultyMultiplier) === 0)) {
+                spawnEnemy();
+                difficultyMultiplier += 0.01; // Increase difficulty over time
+            }
+
+            // 3. Update Enemies
+            enemies.forEach(enemy => enemy.update());
+
+            // 4. Update Projectiles
+            projectiles.forEach(p => p.update());
+            enemyProjectiles.forEach(p => p.update());
+
+            // 5. Collision Detection
+            // Player Projectiles vs Enemies
+            for (let i = projectiles.length - 1; i >= 0; i--) {
+                const p = projectiles[i];
+                let hitEnemy = false;
+                for (let j = enemies.length - 1; j >= 0; j--) {
+                    const e = enemies[j];
+                    if (dist(p.x, p.y, e.x, e.y) < p.radius + e.radius) {
+                        e.hp -= 10; // Player projectile damage
+                        hitEnemy = true;
+                        if (e.hp <= 0) {
+                            enemies.splice(j, 1);
+                            score += 10;
+                            document.getElementById('score-value').textContent = score;
+                        }
+                        break;
+                    }
+                }
+                if (hitEnemy || p.isOffScreen()) {
+                    projectiles.splice(i, 1);
+                }
+            }
+
+            // Enemy Projectiles vs Player
+            for (let i = enemyProjectiles.length - 1; i >= 0; i--) {
+                const p = enemyProjectiles[i];
+                if (dist(p.x, p.y, player.x, player.y) < p.radius + player.radius) {
+                    player.hp -= 5;
+                    enemyProjectiles.splice(i, 1);
+                    if (player.hp <= 0) {
+                        gameOver();
+                    }
+                } else if (p.isOffScreen()) {
+                    enemyProjectiles.splice(i, 1);
+                }
+            }
+
+            // Enemy vs Player (Touch Damage)
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const e = enemies[i];
+                if (dist(player.x, player.y, e.x, e.y) < player.radius + e.radius) {
+                    player.hp -= 1; // Continuous damage on touch
+                    // Simple knockback
+                    const angle = Math.atan2(player.y - e.y, player.x - e.x);
+                    player.x += Math.cos(angle) * 5;
+                    player.y += Math.sin(angle) * 5;
+                    e.x -= Math.cos(angle) * 2;
+                    e.y -= Math.sin(angle) * 2;
+
+                    if (player.hp <= 0) {
+                        gameOver();
+                    }
+                }
+            }
+        }
+
+        function drawGame() {
+            // Clear canvas
+            ctx.fillStyle = '#111827'; // Dark gray background
+            ctx.fillRect(0, 0, W, H);
+
+            // Draw game elements
+            projectiles.forEach(p => p.draw());
+            enemyProjectiles.forEach(p => p.draw());
+            enemies.forEach(e => e.draw());
+            player.draw();
+
+            // Draw HUD over game elements
+            document.getElementById('hp-value').textContent = player.hp;
+            // Update HP bar visual (Tailwind utility)
+            const hpPercentage = Math.max(0, player.hp / player.maxHp) * 100;
+            document.getElementById('hp-bar-fill').style.width = `${hpPercentage}%`;
+
+            if (isGameOver) {
+                // Game Over Overlay
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, W, H);
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 48px Inter, sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('GAME OVER', W / 2, H / 2 - 40);
+                ctx.font = '24px Inter, sans-serif';
+                ctx.fillText(`Final Score: ${score}`, W / 2, H / 2);
+                
+                // Show game over modal
+                document.getElementById('game-over-modal').classList.remove('hidden');
+            }
+        }
+
+        function gameLoop() {
+            updateGame();
+            drawGame();
+            gameLoopId = requestAnimationFrame(gameLoop);
+        }
+
+        function startGame() {
+            resizeCanvas();
+            document.getElementById('start-screen').classList.add('hidden');
+            document.getElementById('game-over-modal').classList.add('hidden');
+
+            player = new Player();
+            enemies = [];
+            projectiles = [];
+            enemyProjectiles = [];
+            score = 0;
+            difficultyMultiplier = 1;
+            isGameOver = false;
+            
+            // Clear any previous animation frame
+            if (gameLoopId) cancelAnimationFrame(gameLoopId);
+            gameLoop();
+        }
+
+        function gameOver() {
+            isGameOver = true;
+            cancelAnimationFrame(gameLoopId);
+            // Save score and then load scores (will be handled by the saveScore function)
+            saveScore(score);
+        }
+
+        // --- Event Listeners ---
+
+        document.addEventListener('keydown', (e) => {
+            KEYS[e.key] = true;
+            // Prevent default behavior for arrows
+            if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 's', 'a', 'd'].includes(e.key.toLowerCase())) {
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            KEYS[e.key] = false;
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            mouse.x = e.clientX - rect.left;
+            mouse.y = e.clientY - rect.top;
+        });
+
+        document.addEventListener('click', (e) => {
+            if (!isGameOver) {
+                // Check if the click is on the canvas
+                const rect = canvas.getBoundingClientRect();
+                if (e.clientX >= rect.left && e.clientX <= rect.right &&
+                    e.clientY >= rect.top && e.clientY <= rect.bottom) {
+                    player.shoot(mouse.x, mouse.y);
+                }
+            }
+        });
+
+        document.getElementById('retry-button').addEventListener('click', startGame);
+        document.getElementById('start-button').addEventListener('click', startGame);
+
+        // --- High Score Logic ---
+
+        async function saveScore(finalScore) {
+            if (!isAuthReady || !db) {
+                console.warn("Firestore not ready. Score not saved.");
+                return;
+            }
+
+            document.getElementById('leaderboard-status').textContent = 'Saving score...';
+            document.getElementById('your-score-value').textContent = finalScore;
+
+            try {
+                const scoresRef = getPublicScoresCollection();
+                await addDoc(scoresRef, {
+                    score: finalScore,
+                    userId: userId,
+                    timestamp: Date.now()
+                });
+                document.getElementById('leaderboard-status').textContent = 'Score saved!';
+                loadScores(); // Load updated scores after saving
+            } catch (error) {
+                console.error("Error saving score:", error);
+                document.getElementById('leaderboard-status').textContent = 'Error saving score. Check console.';
+            }
+        }
+
+        async function loadScores() {
+            if (!isAuthReady || !db) {
+                document.getElementById('leaderboard-list').innerHTML = `
+                    <li class="p-2 text-sm text-gray-400">
+                        <span class="font-bold">Error:</span> Leaderboard disabled (Firebase not ready).
+                    </li>
+                `;
+                return;
+            }
+
+            const leaderboardList = document.getElementById('leaderboard-list');
+            leaderboardList.innerHTML = '';
+            document.getElementById('leaderboard-status').textContent = 'Loading leaderboard...';
+
+            try {
+                const scoresRef = getPublicScoresCollection();
+                // Query for the top 5 scores, ordered descending by score
+                const q = query(scoresRef, orderBy("score", "desc"), limit(5));
+                const querySnapshot = await getDocs(q);
+
+                if (querySnapshot.empty) {
+                    leaderboardList.innerHTML = `<li class="p-2 text-sm text-gray-400">No scores yet! Be the first.</li>`;
+                } else {
+                    querySnapshot.forEach((doc, index) => {
+                        const data = doc.data();
+                        const isYou = data.userId === userId;
+                        const listItem = document.createElement('li');
+                        listItem.className = `p-2 rounded-lg flex justify-between items-center transition duration-200 ${isYou ? 'bg-indigo-600 text-white shadow-lg font-bold' : 'bg-gray-700 text-gray-200 hover:bg-gray-600'}`;
+                        listItem.innerHTML = `
+                            <span class="w-1/6">${index + 1}.</span>
+                            <span class="w-3/6 truncate" title="${data.userId}">${isYou ? 'YOU' : data.userId}</span>
+                            <span class="w-2/6 text-right">${data.score} Kills</span>
+                        `;
+                        leaderboardList.appendChild(listItem);
+                    });
+                }
+                document.getElementById('leaderboard-status').textContent = 'Leaderboard loaded.';
+            } catch (error) {
+                console.error("Error loading scores:", error);
+                document.getElementById('leaderboard-status').textContent = 'Error loading leaderboard. Check console.';
+            }
+        }
+
+        // Initialize game and load scores on window load
+        window.onload = function() {
+            loadScores();
+            // Start the game by showing the start screen, waiting for user input
+        };
+
+        // Ensure canvas resize runs initially
+        resizeCanvas();
+
+    </script>
+    <style>
+        /* Custom CSS for the Game Canvas */
+        body {
+            background-color: #0d1117; /* Dark background matching Tailwind's dark theme */
+            font-family: 'Inter', sans-serif;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #gameCanvas {
+            box-shadow: 0 0 20px rgba(79, 70, 229, 0.5); /* Indigo glow */
+            border-radius: 12px;
+            cursor: crosshair;
+            touch-action: none; /* Prevent touch scrolling on canvas */
+        }
+        .ui-panel {
+            min-width: 300px;
+            max-width: 350px;
+        }
+        .action-button {
+            transition: all 0.1s ease-in-out;
+            cursor: pointer;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -2px rgba(0, 0, 0, 0.5);
+        }
+        .action-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.5), 0 4px 6px -4px rgba(79, 70, 229, 0.5);
+        }
+        .action-button:active {
+            transform: translateY(1px);
+            box-shadow: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+
+    <div class="flex flex-col lg:flex-row h-screen w-full p-4 lg:p-8 space-y-4 lg:space-y-0 lg:space-x-8 max-w-7xl">
+
+        <!-- Left UI Panel (Status and Controls) -->
+        <div class="ui-panel bg-gray-800 p-6 rounded-xl shadow-2xl flex-shrink-0 order-2 lg:order-1">
+            <h1 class="text-3xl font-extrabold text-indigo-400 mb-4 border-b border-gray-700 pb-2">Arena Apex</h1>
+            
+            <div class="space-y-4">
+                <!-- User ID -->
+                <div class="bg-gray-900 p-3 rounded-lg text-sm truncate">
+                    <p class="font-semibold text-gray-400">Your ID</p>
+                    <p id="user-id" class="text-gray-300 font-mono text-xs break-all">Authenticating...</p>
+                </div>
+
+                <!-- Game Stats -->
+                <div class="bg-gray-700 p-4 rounded-lg shadow-inner">
+                    <h2 class="text-xl font-bold mb-3 text-indigo-300">STATS</h2>
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="font-medium">Kills:</span>
+                        <span id="score-value" class="text-2xl font-bold text-yellow-400">0</span>
+                    </div>
+                    <div class="mb-3">
+                        <span class="font-medium block mb-1">Health: <span id="hp-value">100</span></span>
+                        <div class="w-full bg-red-800 rounded-full h-3">
+                            <div id="hp-bar-fill" class="bg-lime-500 h-3 rounded-full transition-all duration-300" style="width: 100%;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Controls -->
+                <div class="bg-gray-700 p-4 rounded-lg shadow-inner">
+                    <h2 class="text-xl font-bold mb-3 text-indigo-300">CONTROLS</h2>
+                    <ul class="text-sm space-y-1">
+                        <li class="flex justify-between"><span>Movement:</span> <kbd class="px-2 py-0.5 bg-gray-900 rounded-md">W A S D</kbd> / <kbd class="px-2 py-0.5 bg-gray-900 rounded-md">Arrows</kbd></li>
+                        <li class="flex justify-between"><span>Aim & Shoot:</span> <kbd class="px-2 py-0.5 bg-gray-900 rounded-md">Mouse Click</kbd></li>
+                        <li class="text-gray-400 pt-2 text-xs">Stay mobile and eliminate the red enemies!</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Center Game Area -->
+        <div id="game-container" class="flex-grow flex justify-center items-center rounded-xl shadow-2xl bg-gray-900 order-1 lg:order-2 h-full min-h-[300px] lg:min-h-0">
+            <canvas id="gameCanvas" class="w-full h-full"></canvas>
+
+            <!-- Start Screen Overlay -->
+            <div id="start-screen" class="absolute inset-0 flex flex-col justify-center items-center bg-gray-900/95 backdrop-blur-sm rounded-xl z-20">
+                <h2 class="text-6xl font-extrabold text-indigo-400 mb-4 animate-pulse">ARENA APEX</h2>
+                <p class="text-xl text-gray-300 mb-8">A fast-paced, top-down action shooter.</p>
+                <button id="start-button" class="action-button bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 px-8 rounded-full text-lg">
+                    START GAME
+                </button>
+            </div>
+            
+            <!-- Game Over Modal (Hidden by Default) -->
+            <div id="game-over-modal" class="absolute inset-0 hidden flex-col justify-center items-center bg-gray-900/90 backdrop-blur-sm rounded-xl z-30">
+                <div class="bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-md text-center border-2 border-indigo-500">
+                    <h2 class="text-5xl font-extrabold text-red-500 mb-4">DEFEATED!</h2>
+                    <p class="text-2xl text-gray-300 mb-6">Your Battle is Over.</p>
+                    <p class="text-4xl font-black text-yellow-400 mb-8">Score: <span id="your-score-value">0</span></p>
+                    <p class="text-sm text-gray-400 mb-4" id="leaderboard-status">Saving score...</p>
+                    <button id="retry-button" class="action-button bg-lime-500 hover:bg-lime-600 text-white font-bold py-3 px-8 rounded-full text-lg">
+                        RETRY MISSION
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right UI Panel (Leaderboard) -->
+        <div class="ui-panel bg-gray-800 p-6 rounded-xl shadow-2xl flex-shrink-0 order-3 lg:order-3">
+            <h2 class="text-2xl font-extrabold text-yellow-400 mb-4 border-b border-gray-700 pb-2">Global Leaderboard</h2>
+            <div class="space-y-2">
+                <ul id="leaderboard-list" class="space-y-2">
+                    <!-- Scores will be injected here by JavaScript -->
+                    <li class="p-2 text-sm text-gray-400">Loading scores...</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
