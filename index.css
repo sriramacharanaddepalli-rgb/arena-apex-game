@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arena Apex - 2D Shooter</title>
+    <!-- Load Tailwind CSS for modern styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Load Firebase SDKs -->
+    <script type="module">
+        // FIX: Static imports MUST be at the top level of the module.
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // Import all required v9 modular functions for the game script
+        import { getFirestore, onSnapshot, collection, query, addDoc, limit, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables for Firebase configuration and application state
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        if (firebaseConfig) {
+            const app = initializeApp(firebaseConfig);
+            const db = getFirestore(app);
+            const auth = getAuth(app);
+
+            // Set up authentication and store global accessors
+            window.db = db;
+            window.auth = auth;
+            window.appId = appId;
+            window.isFirebaseReady = false;
+            
+            // Make Firestore functions available globally for the main script block
+            window.onSnapshot = onSnapshot;
+            window.collection = collection;
+            window.query = query;
+            window.addDoc = addDoc;
+            window.limit = limit;
+            window.orderBy = orderBy;
+            
+            const authenticate = async () => {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                        console.log("Authenticated with custom token.");
+                    } else {
+                        await signInAnonymously(auth);
+                        console.log("Signed in anonymously.");
+                    }
+                } catch (error) {
+                    console.error("Firebase Auth error:", error);
+                }
+            };
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    window.userId = user.uid;
+                    window.isFirebaseReady = true;
+                    console.log("User ID set:", window.userId);
+
+                    // Initialize game-specific Firebase listeners
+                    if (window.initFirebaseListeners) {
+                        window.initFirebaseListeners();
+                    }
+                } else {
+                    // Sign in if not already authenticated
+                    authenticate();
+                }
+            });
+        } else {
+            console.error("Firebase configuration not available. Leaderboard will be disabled.");
+        }
+    </script>
+    <style>
+        /* --- CUSTOM CSS FOR GAME AESTHETICS --- */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0d1117; /* Dark background matching GitHub dark mode */
+            color: #c9d1d9;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 1rem;
+        }
+        
+        #gameCanvas {
+            background-color: #161b22; /* Slightly lighter dark background for the canvas */
+            border: 4px solid #30363d;
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.5);
+            border-radius: 12px;
+            touch-action: none; /* Prevent browser touch behavior */
+            width: 100%; /* Make canvas responsive within its container */
+            max-width: 800px;
+            height: auto;
+            aspect-ratio: 4/3; /* Maintain 4:3 aspect ratio */
+        }
+        
+        .ui-panel {
+            background-color: #21262d;
+            border-radius: 8px;
+            padding: 1.5rem; /* Increased padding */
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4); /* Stronger shadow */
+            width: 100%;
+            max-width: 600px;
+            border: 1px solid #30363d;
+        }
+        
+        .leaderboard-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.6rem 0;
+            border-bottom: 1px solid #30363d;
+            font-size: 0.95rem;
+        }
+        
+        .leaderboard-item:last-child {
+            border-bottom: none;
+        }
+        
+        .score-button {
+            transition: all 0.2s ease-in-out;
+            /* Added a subtle gradient and rounded corners */
+            background-image: linear-gradient(to right, #10b981, #059669); 
+            border: none;
+        }
+        
+        .score-button:hover:not(:disabled) {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 15px rgba(16, 185, 129, 0.4);
+            background-image: linear-gradient(to right, #059669, #10b981);
+        }
+
+        .score-button:disabled {
+            cursor: not-allowed;
+            background-color: #4b5563;
+            background-image: none;
+            opacity: 0.6;
+            transform: none;
+            box-shadow: none;
+        }
+
+        /* Responsive adjustments for the main container */
+        @media (max-width: 1024px) {
+            #game-container {
+                flex-direction: column;
+            }
+            #gameCanvas {
+                width: 100%;
+                max-width: 100%;
+            }
+        }
+
+        /* Styling for the score display box */
+        #score-display {
+            border: 2px solid #5a626b;
+            box-shadow: 0 0 10px rgba(255, 215, 0, 0.2);
+        }
+
+    </style>
+</head>
+<body class="p-4">
+
+    <div id="game-container" class="flex flex-col lg:flex-row gap-6 w-full max-w-6xl">
+        
+        <!-- Game Canvas -->
+        <div class="flex-grow flex items-center justify-center">
+            <canvas id="gameCanvas" width="800" height="600"></canvas>
+        </div>
+        
+        <!-- UI & Leaderboard Panel -->
+        <div class="ui-panel lg:w-96 flex-shrink-0">
+            <h1 class="text-3xl font-bold mb-4 text-center text-blue-400">ARENA APEX</h1>
+            <div id="status-message" class="mb-4 p-3 bg-red-800/50 text-red-300 rounded-md text-sm text-center">Game Over! Press R to restart.</div>
+
+            <div id="score-display" class="mb-4 text-center text-2xl font-mono p-3 bg-gray-700 rounded-lg">
+                Score: <span id="current-score">0</span>
+            </div>
+
+            <button id="post-score-btn" class="score-button w-full py-3 text-white font-bold rounded-lg mb-4" onclick="handlePostScore()" disabled>
+                Post Score to Leaderboard
+            </button>
+            
+            <h2 class="text-xl font-semibold mb-3 text-yellow-400 border-b border-yellow-400/30 pb-1">Global Leaderboard</h2>
+            <div id="leaderboard" class="h-64 overflow-y-auto">
+                <p class="text-center text-gray-500">Loading scores...</p>
+            </div>
+        </div>
+
+    </div>
+    
+    <div class="mt-6 ui-panel">
+        <h3 class="text-lg font-semibold mb-2 text-center text-gray-300">Controls & Rules</h3>
+        <p class="text-sm text-gray-400 text-center">
+            **Move:** WASD or Arrow Keys | **Shoot:** Mouse Click or Spacebar. <br>
+            Collect score items (Green Circles) and avoid the red enemy squares.
+        </p>
+    </div>
+
+    <!-- The Game Logic Script -->
+    <script>
+        // --- GAME CONSTANTS & STATE ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const SCORE_COLLECTION = 'game_scores';
+        const PLAYER_SIZE = 20;
+        const ENEMY_SIZE = 15;
+        const SCORE_SIZE = 10;
+        const BULLET_SIZE = 5;
+        const PLAYER_SPEED = 5;
+        const BULLET_SPEED = 10;
+
+        let player = { x: canvas.width / 2, y: canvas.height / 2, health: 100 };
+        let bullets = [];
+        let enemies = [];
+        let scoreItems = [];
+        let keys = {};
+        let score = 0;
+        let gameOver = false;
+        let lastEnemyTime = 0;
+        const ENEMY_SPAWN_INTERVAL = 1000; // milliseconds
+
+        // --- DOM ELEMENTS ---
+        const scoreDisplay = document.getElementById('current-score');
+        const statusMessage = document.getElementById('status-message');
+        const leaderboardDiv = document.getElementById('leaderboard');
+        const postScoreBtn = document.getElementById('post-score-btn');
+
+        // --- FIREBASE FUNCTIONS ---
+        window.initFirebaseListeners = () => {
+            if (!window.db || !window.onSnapshot) return;
+
+            // FIX: Use v9 modular syntax for collection and query
+            const collectionRef = window.collection(window.db, `artifacts/${window.appId}/public/data/${SCORE_COLLECTION}`);
+            const q = window.query(collectionRef, window.orderBy('score', 'desc'), window.limit(10));
+
+            // Use the client-side 'onSnapshot' to listen for real-time changes
+            window.onSnapshot(q, (snapshot) => {
+                const scores = [];
+                snapshot.forEach(doc => {
+                    scores.push({ id: doc.id, ...doc.data() });
+                });
+                renderLeaderboard(scores);
+            }, (error) => {
+                console.error("Error reading leaderboard:", error);
+                leaderboardDiv.innerHTML = '<p class="text-center text-red-500">Error loading leaderboard.</p>';
+            });
+        };
+
+        const renderLeaderboard = (scores) => {
+            leaderboardDiv.innerHTML = '';
+            if (scores.length === 0) {
+                leaderboardDiv.innerHTML = '<p class="text-center text-gray-500">No scores yet! Be the first!</p>';
+                return;
+            }
+
+            scores.forEach((item, index) => {
+                const rank = index + 1;
+                const element = document.createElement('div');
+                // Highlight the current user's score
+                element.className = 'leaderboard-item ' + (item.userId === window.userId ? 'text-green-400 font-bold bg-gray-800/50 rounded px-2' : '');
+                element.innerHTML = `
+                    <span>#${rank} - Player ${item.userId.substring(0, 6)}...</span>
+                    <span>${item.score} pts</span>
+                `;
+                leaderboardDiv.appendChild(element);
+            });
+        };
+
+        const saveScore = async (finalScore) => {
+            if (!window.isFirebaseReady || !window.addDoc || !window.collection) {
+                console.error("Firebase not ready to save score.");
+                return;
+            }
+
+            const scoreData = {
+                userId: window.userId,
+                score: finalScore,
+                timestamp: Date.now()
+            };
+
+            try {
+                // FIX: Use v9 modular syntax for addDoc and collection
+                // Public data path: /artifacts/{appId}/public/data/{collectionName}/{documentId}
+                const collectionRef = window.collection(window.db, `artifacts/${window.appId}/public/data/${SCORE_COLLECTION}`);
+                await window.addDoc(collectionRef, scoreData);
+                statusMessage.textContent = "Score successfully posted to the global leaderboard!";
+                statusMessage.className = 'mb-4 p-3 bg-green-800/50 text-green-300 rounded-md text-sm text-center';
+                postScoreBtn.disabled = true; // Disable after successful post
+            } catch (e) {
+                console.error("Error adding document: ", e);
+                statusMessage.textContent = "Error posting score. See console for details.";
+                statusMessage.className = 'mb-4 p-3 bg-yellow-800/50 text-yellow-300 rounded-md text-sm text-center';
+            }
+        };
+
+        window.handlePostScore = () => {
+            if (gameOver && score > 0 && !postScoreBtn.disabled) {
+                saveScore(score);
+            }
+        };
+
+        // --- GAME LOGIC FUNCTIONS ---
+
+        const spawnEnemy = () => {
+            // Spawn outside the canvas area randomly
+            let side = Math.floor(Math.random() * 4); // 0: Top, 1: Right, 2: Bottom, 3: Left
+            let x, y;
+            if (side === 0) { // Top
+                x = Math.random() * canvas.width;
+                y = -ENEMY_SIZE;
+            } else if (side === 1) { // Right
+                x = canvas.width + ENEMY_SIZE;
+                y = Math.random() * canvas.height;
+            } else if (side === 2) { // Bottom
+                x = Math.random() * canvas.width;
+                y = canvas.height + ENEMY_SIZE;
+            } else { // Left
+                x = -ENEMY_SIZE;
+                y = Math.random() * canvas.height;
+            }
+
+            // Simple movement: move towards the player center
+            const dx = (player.x - x) / 100;
+            const dy = (player.y - y) / 100;
+
+            enemies.push({ x, y, dx, dy, health: 30, size: ENEMY_SIZE });
+        };
+
+        const spawnScoreItem = () => {
+            if (Math.random() < 0.2) { // 20% chance to spawn
+                const x = Math.random() * (canvas.width - SCORE_SIZE * 2) + SCORE_SIZE;
+                const y = Math.random() * (canvas.height - SCORE_SIZE * 2) + SCORE_SIZE;
+                scoreItems.push({ x, y, value: 50 });
+            }
+        };
+
+        const drawPlayer = () => {
+            ctx.fillStyle = '#007FFF'; // Blue
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, PLAYER_SIZE, 0, Math.PI * 2);
+            ctx.fill();
+            // Draw health bar
+            ctx.fillStyle = 'red';
+            ctx.fillRect(player.x - 20, player.y - PLAYER_SIZE - 10, 40, 5);
+            ctx.fillStyle = 'lime';
+            ctx.fillRect(player.x - 20, player.y - PLAYER_SIZE - 10, (player.health / 100) * 40, 5);
+        };
+
+        const drawBullets = () => {
+            ctx.fillStyle = '#FFD700'; // Gold
+            bullets.forEach(bullet => {
+                ctx.beginPath();
+                ctx.arc(bullet.x, bullet.y, BULLET_SIZE, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        };
+
+        const drawEnemies = () => {
+            ctx.fillStyle = '#FF4500'; // Orange-Red
+            enemies.forEach(enemy => {
+                ctx.fillRect(enemy.x - enemy.size / 2, enemy.y - enemy.size / 2, enemy.size, enemy.size);
+            });
+        };
+
+        const drawScoreItems = () => {
+            ctx.fillStyle = '#3CB371'; // Medium Sea Green
+            scoreItems.forEach(item => {
+                ctx.beginPath();
+                ctx.arc(item.x, item.y, SCORE_SIZE, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        };
+
+        const checkCollision = (obj1, size1, obj2, size2) => {
+            const dx = obj1.x - obj2.x;
+            const dy = obj1.y - obj2.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            return distance < size1 + size2;
+        };
+
+        const updateGame = (deltaTime) => {
+            if (gameOver) return;
+
+            // --- Player Movement ---
+            let dx = 0;
+            let dy = 0;
+            if (keys['w'] || keys['ArrowUp']) dy -= 1;
+            if (keys['s'] || keys['ArrowDown']) dy += 1;
+            if (keys['a'] || keys['ArrowLeft']) dx -= 1;
+            if (keys['d'] || keys['ArrowRight']) dx += 1;
+
+            if (dx !== 0 || dy !== 0) {
+                const length = Math.sqrt(dx * dx + dy * dy);
+                if (length > 0) {
+                    player.x += (dx / length) * PLAYER_SPEED;
+                    player.y += (dy / length) * PLAYER_SPEED;
+                }
+            }
+
+            // Keep player within bounds
+            player.x = Math.max(PLAYER_SIZE, Math.min(canvas.width - PLAYER_SIZE, player.x));
+            player.y = Math.max(PLAYER_SIZE, Math.min(canvas.height - PLAYER_SIZE, player.y));
+
+            // --- Spawning ---
+            const now = Date.now();
+            if (now - lastEnemyTime > ENEMY_SPAWN_INTERVAL) {
+                spawnEnemy();
+                lastEnemyTime = now;
+            }
+            spawnScoreItem();
+
+            // --- Bullet Updates ---
+            bullets.forEach(bullet => {
+                bullet.x += bullet.dx;
+                bullet.y += bullet.dy;
+            });
+            // Remove off-screen bullets
+            bullets = bullets.filter(b => b.x > 0 && b.x < canvas.width && b.y > 0 && b.y < canvas.height);
+
+            // --- Enemy Updates and Collisions ---
+            enemies.forEach(enemy => {
+                // Simple homing movement towards player's current location
+                const angle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+                enemy.x += Math.cos(angle) * (1 + score / 5000); // Speed scales with score
+                enemy.y += Math.sin(angle) * (1 + score / 5000);
+
+                // Enemy-Player collision
+                if (checkCollision(player, PLAYER_SIZE, enemy, enemy.size)) {
+                    player.health -= 0.5;
+                }
+            });
+
+            // --- Bullet-Enemy Collisions ---
+            let hitEnemies = new Set();
+            bullets = bullets.filter(bullet => {
+                let hit = false;
+                enemies.forEach((enemy, enemyIndex) => {
+                    if (checkCollision(bullet, BULLET_SIZE, enemy, enemy.size)) {
+                        hit = true;
+                        hitEnemies.add(enemyIndex);
+                        enemy.health -= 10; // Reduce enemy health
+                        if (enemy.health <= 0) {
+                            score += 100;
+                        }
+                    }
+                });
+                return !hit;
+            });
+
+            // Filter out dead enemies
+            enemies = enemies.filter(enemy => enemy.health > 0);
+
+            // --- Player-ScoreItem Collisions ---
+            scoreItems = scoreItems.filter(item => {
+                if (checkCollision(player, PLAYER_SIZE, item, SCORE_SIZE)) {
+                    score += item.value;
+                    return false; // Remove item
+                }
+                return true;
+            });
+
+            // Update score display
+            scoreDisplay.textContent = score;
+
+            // --- Game Over Check ---
+            if (player.health <= 0) {
+                endGame();
+            }
+        };
+
+        const endGame = () => {
+            gameOver = true;
+            statusMessage.textContent = `Game Over! Your Final Score: ${score}. Press R to restart.`;
+            statusMessage.className = 'mb-4 p-3 bg-red-600 text-white font-bold rounded-md text-sm text-center';
+            postScoreBtn.disabled = !(score > 0 && window.isFirebaseReady);
+        };
+
+        const restartGame = () => {
+            player = { x: canvas.width / 2, y: canvas.height / 2, health: 100 };
+            bullets = [];
+            enemies = [];
+            scoreItems = [];
+            score = 0;
+            gameOver = false;
+            statusMessage.textContent = 'Use WASD/Arrows to move, Mouse Click to shoot!';
+            statusMessage.className = 'mb-4 p-3 bg-blue-800/50 text-blue-300 rounded-md text-sm text-center';
+            postScoreBtn.disabled = true;
+            gameLoop(); // Restart the loop
+        };
+
+        // --- GAME LOOP ---
+        let lastTime = 0;
+        const gameLoop = (timestamp) => {
+            if (gameOver) return;
+
+            const deltaTime = timestamp - lastTime;
+            lastTime = timestamp;
+
+            // 1. Clear Canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 2. Update Game State
+            updateGame(deltaTime);
+
+            // 3. Draw Elements
+            drawScoreItems();
+            drawBullets();
+            drawEnemies();
+            drawPlayer();
+
+            // 4. Loop
+            requestAnimationFrame(gameLoop);
+        };
+
+        // --- INPUT HANDLERS ---
+        window.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+            if (e.key.toLowerCase() === 'r' && gameOver) {
+                restartGame();
+            }
+            // Prevent scrolling
+            if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+                e.preventDefault();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+        });
+
+        // Firing mechanism (Mouse Click or Spacebar)
+        const fireBullet = (e) => {
+            if (gameOver) return;
+            let targetX, targetY;
+
+            if (e.type === 'click') {
+                const rect = canvas.getBoundingClientRect();
+                targetX = e.clientX - rect.left;
+                targetY = e.clientY - rect.top;
+            } else if (keys[' ']) {
+                // If using spacebar, use a fixed upward direction for simplicity
+                targetX = player.x; 
+                targetY = player.y - 100;
+            } else {
+                return;
+            }
+
+            // Calculate direction vector
+            const dx = targetX - player.x;
+            const dy = targetY - player.y;
+            const magnitude = Math.sqrt(dx * dx + dy * dy);
+
+            if (magnitude > 0) {
+                bullets.push({
+                    x: player.x,
+                    y: player.y,
+                    dx: (dx / magnitude) * BULLET_SPEED,
+                    dy: (dy / magnitude) * BULLET_SPEED
+                });
+            }
+        };
+
+        // Attach event listeners
+        canvas.addEventListener('click', fireBullet);
+        window.addEventListener('keydown', (e) => {
+            if (e.key === ' ' || e.key === 'Spacebar') { // For spacebar firing
+                fireBullet(e);
+            }
+        });
+
+        // --- INITIALIZATION ---
+        window.onload = function() {
+            // Resize canvas to fit the aspect ratio accurately after load
+            const updateCanvasSize = () => {
+                const container = document.getElementById('gameCanvas').parentElement;
+                const containerWidth = container.clientWidth;
+                // Maintain 4:3 aspect ratio
+                const newHeight = containerWidth * (3 / 4);
+                
+                // Only change canvas attributes, not CSS styles, for drawing context
+                canvas.width = 800; 
+                canvas.height = 600; 
+                
+                // Note: The CSS rules handle the visual resizing.
+            };
+
+            updateCanvasSize();
+            window.addEventListener('resize', updateCanvasSize);
+            
+            restartGame(); // Initial setup and start game loop
+        }
+
+    </script>
+</body>
+</html>
